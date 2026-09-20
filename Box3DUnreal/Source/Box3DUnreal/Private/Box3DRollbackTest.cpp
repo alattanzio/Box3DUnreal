@@ -1,20 +1,7 @@
 // Author: Antonio Lattanzio - emptyvessel
 
-// Self-contained proof of the rollback/reconciliation algorithm (doc §11b, D2). No actors, no
-// network - two raw box3d worlds model a server and a predicting client:
-//
-//   1. Both run the same deterministic scene, so with no events they stay in lockstep (D0).
-//   2. An "unmirrored gameplay event" (an impulse) hits body 0 on the SERVER only, so the client's
-//      prediction drifts.
-//   3. The server's state at a past frame arrives at the client one network-delay later (a stale
-//      authoritative snapshot).
-//   4. The client rolls back to that frame, stamps the authoritative state, and deterministically
-//      replays to the present - and must land exactly where the server now is.
-//
-// Also checks the fast path: with no event, reconcile sees the prediction was right and does not
-// roll back. Run headless:
-//   UnrealEditor-Cmd <project> <map> -game -nullrhi -ExecCmds="box3d.RollbackTest, quit"
 
+#include "Box3DConversion.h"
 #include "Box3DLog.h"
 #include "Box3DPrediction.h"
 #include "Box3DSnapshot.h"
@@ -94,8 +81,6 @@ namespace
 		return Max;
 	}
 
-	// The core scenario. bInjectEvent = false exercises the no-correction fast path.
-	// Returns true on the expected outcome.
 	bool RunScenario(bool bInjectEvent)
 	{
 		b3WorldId Server = MakeRollbackWorld();
@@ -116,14 +101,10 @@ namespace
 
 		TArray<Box3D::FBodyState> AuthStates;
 
-		// Step to the present. The client captures its ring each frame; the server captures the
-		// authoritative packet as it passes AuthFrame; the event hits the server at EventFrame.
 		for (int32 Frame = 1; Frame <= PresentFrame; ++Frame)
 		{
 			if (bInjectEvent && Frame == EventFrame)
 			{
-				// Unmirrored on the client: a shove it never saw. The cubes mass ~62 kg (0.5 m,
-				// 500 kg/m^3), so this is a several-m/s kick - well past the reconcile tolerance.
 				b3Body_ApplyLinearImpulseToCenter(ServerBodies[0], b3Vec3{ 400.0f, 0.0f, 250.0f }, true);
 			}
 
@@ -153,10 +134,6 @@ namespace
 		bool bPass;
 		if (bInjectEvent)
 		{
-			// Expect: a real correction that lands the client on the server to within the snapshot's
-			// fidelity. Not bit-exact - the kinematic-only auth snapshot omits the server's warm-start
-			// / contact history at the rollback frame (D1), so replay converges to sub-millimetre, not
-			// to the last bit. 1 mm is far inside what smoothing hides.
 			constexpr double ConvergedTolerance = 1e-3; // 1 mm
 			bPass = Result.bCorrected && Result.ReplayedFrames == NetLatency && DriftAfter < ConvergedTolerance
 					&& DriftAfter < DriftBefore;
@@ -181,6 +158,9 @@ namespace
 
 	void RunRollbackTest()
 	{
+		// Authored in meters; see Box3DDeterminismTest.
+		const Box3D::FScopedLengthUnits Units(1.0f);
+
 		const bool bEvent = RunScenario(/*bInjectEvent=*/true);
 		const bool bNoEvent = RunScenario(/*bInjectEvent=*/false);
 		if (bEvent && bNoEvent)

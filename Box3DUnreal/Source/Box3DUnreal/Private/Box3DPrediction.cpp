@@ -29,8 +29,6 @@ namespace Box3D
 		{
 			return -1;
 		}
-		// The window is the last Capacity frames; the oldest still-valid frame is the lowest one
-		// whose slot hasn't been overwritten.
 		const int32 Lowest = FMath::Max(0, Newest - Capacity + 1);
 		return FindSlot(Lowest) != INDEX_NONE ? Lowest : -1;
 	}
@@ -110,8 +108,6 @@ namespace Box3D
 			return Result;
 		}
 
-		// Compare the authority to what the client predicted at that frame. If every corrected body
-		// already agrees within tolerance, prediction was right - skip the rollback entirely.
 		TArray<FBodyState> Predicted;
 		if (!Ring.GetStates(AuthFrame, Predicted))
 		{
@@ -149,8 +145,6 @@ namespace Box3D
 		// Overwrite the ring entry at AuthFrame so it reflects the corrected state.
 		Ring.Capture(AuthFrame, Bodies);
 
-		// Deterministically replay forward to the present, re-capturing each frame so the ring
-		// stays valid for the next correction.
 		for (int32 Frame = AuthFrame + 1; Frame <= PresentFrame; ++Frame)
 		{
 			b3World_Step(World, TimeStep, SubStepCount);

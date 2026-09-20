@@ -6,15 +6,6 @@
 #include "Box3DSnapshot.h"
 #include <box3d/box3d.h>
 
-// Client-side prediction + rollback core (doc §11b, D2). Built on the D0/D1 foundation:
-// determinism (a client re-simulating from an authoritative state reaches the same result the
-// server did) plus the per-body snapshot primitives in Box3DSnapshot.h.
-//
-// The client simulates opted-in bodies locally so they respond with no round-trip latency. The
-// server periodically sends an authoritative, frame-tagged snapshot. Because that snapshot is
-// stale by the network delay, the client rolls the world back to the snapshot's frame, overwrites
-// the corrected bodies, and deterministically replays forward to the present - landing where the
-// server's forward sim will be, not where it was when it sent the packet.
 namespace Box3D
 {
 	/**
@@ -23,7 +14,7 @@ namespace Box3D
 	 * before the replay re-steps), so this stores every body's FBodyState per frame.
 	 *
 	 * Assumes a stable body set and order across frames - true for persistent bodies; spawn/despawn
-	 * mid-window is out of scope for this first cut (see doc §11b limitations).
+	 * mid-window is out of scope for this first cut.
 	 */
 	class BOX3DUNREAL_API FSnapshotRing
 	{

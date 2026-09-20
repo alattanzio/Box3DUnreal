@@ -5,16 +5,6 @@
 #include "CoreMinimal.h"
 #include <box3d/box3d.h>
 
-// Per-body state capture / restore / hash: the foundation for determinism verification
-// (doc §14 D0) and client-side rollback (D2). box3d exposes no live-world serialize, so a
-// "snapshot" is the kinematic state of each body read back through the public getters.
-//
-// IMPORTANT (fidelity): this captures a body's transform + velocity + awake flag, NOT the
-// solver's internal history - warm-start impulses, contact anchors, sleep timers. Restoring
-// then re-simulating is therefore NOT guaranteed bit-identical to a run that never rolled
-// back; warm starting is the main divergence source (measure with box3d.SnapshotTest, and
-// see b3World_EnableWarmStarting). Everything crossing here stays in box3d space - no Unreal
-// conversion - so a hash compares raw simulation state.
 namespace Box3D
 {
 	/** One dynamic body's restorable state, in box3d space. */
@@ -41,8 +31,6 @@ namespace Box3D
 		b3Body_SetTransform(Body, State.Transform.p, State.Transform.q);
 		b3Body_SetLinearVelocity(Body, State.LinearVelocity);
 		b3Body_SetAngularVelocity(Body, State.AngularVelocity);
-		// Order matters: setting velocity wakes a body, so apply the sleep flag last to keep a
-		// body that was asleep at capture time asleep (its sleep timer still resets - see header note).
 		b3Body_SetAwake(Body, State.bAwake);
 	}
 

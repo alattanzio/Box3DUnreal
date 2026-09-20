@@ -1,13 +1,5 @@
 // Author: Antonio Lattanzio - emptyvessel
 
-// Self-checking smoke test for the spatial queries (doc §11). Needs no player and no
-// authored level content: it spawns a known static cube far above the level, fires
-// axis-aligned rays at it, and checks each hit lands on the expected face.
-//
-// The +Y ray is the one that earns its keep: the box3d boundary negates Y, so a sign
-// slip there surfaces as a miss or a flipped normal instead of quiet drift. The normal
-// length check catches the other easy mistake - converting a normal with the cm<->m
-// scale, which would leave it 100 long.
 
 #include "Box3DBodyComponent.h"
 #include "Box3DLog.h"
@@ -96,8 +88,6 @@ namespace
 		FQueryTestTally Tally;
 		const FBox3DQueryFilter Filter;
 
-		// Per axis: start TestRayOffset out on the negative side and cast through the cube.
-		// The closest hit must be the near face, with an outward normal facing the ray.
 		const TPair<FVector, const TCHAR*> Axes[] = {
 			{ FVector(1.0, 0.0, 0.0), TEXT("+X") },
 			{ FVector(0.0, 1.0, 0.0), TEXT("+Y") },

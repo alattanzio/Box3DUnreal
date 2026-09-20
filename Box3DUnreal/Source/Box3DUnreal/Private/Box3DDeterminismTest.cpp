@@ -1,21 +1,7 @@
 // Author: Antonio Lattanzio - emptyvessel
 
-// Self-contained determinism + snapshot tests (doc §14, D0/D1). These build raw box3d worlds
-// directly - no subsystem, no actors, no player - so they prove the simulation's reproducibility
-// and the snapshot fidelity in isolation, and run headless in CI:
-//
-//   UnrealEditor-Cmd <project> <map> -game -nullrhi -ExecCmds="box3d.DeterminismTest, quit"
-//   UnrealEditor-Cmd <project> <map> -game -nullrhi -ExecCmds="box3d.SnapshotTest, quit"
-//
-// box3d.DeterminismTest  - two independent worlds stepped in lockstep must hash identically
-//                          every frame. A divergence points at nondeterminism in the build
-//                          (fast-math, worker count, uninitialised state).
-// box3d.SnapshotTest     - run to a mid-point, snapshot every body, keep running (reference);
-//                          restore the snapshot and re-run the same span (redo). How far redo
-//                          drifts from reference measures what the kinematic-only snapshot loses
-//                          (warm-start impulses, contact anchors). Reported with warm starting
-//                          on and off, so the D2 rollback policy is an informed choice.
 
+#include "Box3DConversion.h"
 #include "Box3DLog.h"
 #include "Box3DSnapshot.h"
 #include "HAL/IConsoleManager.h"
@@ -29,9 +15,6 @@ namespace
 	constexpr int32 SnapshotFrame = 150;   // mid-run: bodies in flight and in contact
 	constexpr int32 RollbackDepth = 6;     // a realistic reconciliation window (~100 ms of latency)
 
-	// A deterministic scene: a static ground plus a fixed lattice of boxes given a fixed initial
-	// spin, so they fall, collide and pile. No RNG - identical every call by construction. Bodies
-	// are created in a fixed order; the returned handles are in that order for a stable hash fold.
 	void BuildScene(b3WorldId World, TArray<b3BodyId>& OutDynamicBodies)
 	{
 		// Ground: a large static box centred below the drop.
@@ -46,8 +29,6 @@ namespace
 			b3CreateHullShape(Ground, &ShapeDef, &Hull.base);
 		}
 
-		// A 4x4x4 lattice of 0.5 m cubes, spaced 1.2 m, starting 3 m up. Deterministic spin per
-		// cube from its integer lattice index so orientations differ without any randomness.
 		const b3BoxHull CubeHull = b3MakeBoxHull(0.25f, 0.25f, 0.25f);
 		for (int32 X = 0; X < 4; ++X)
 		{
@@ -96,6 +77,9 @@ namespace
 
 	void RunDeterminismTest()
 	{
+		// Authored in meters; the length unit is global state a live world may have set.
+		const Box3D::FScopedLengthUnits Units(1.0f);
+
 		b3WorldId WorldA = MakeWorld();
 		b3WorldId WorldB = MakeWorld();
 		TArray<b3BodyId> BodiesA, BodiesB;
@@ -143,10 +127,6 @@ namespace
 		return Max;
 	}
 
-	// Reference world = never rolled back. Redo world = restored from a mid-run snapshot and
-	// re-stepped. Their divergence is what a kinematic-only snapshot loses. Reported at a realistic
-	// rollback depth (a few frames, the honest number for reconciliation) and at a long tail (worst
-	// case: a chaotic pile amplifies any difference).
 	void RunSnapshotTestOnce(bool bWarmStarting)
 	{
 		const int32 TailFrames = TestFrames - SnapshotFrame;
@@ -167,8 +147,6 @@ namespace
 			Snapshot.Add(Box3D::CaptureBodyState(Body));
 		}
 
-		// Redo: a fresh world seeded only from the snapshot (no history), re-stepped in lockstep
-		// with the reference so we can compare pose at matching frames.
 		b3WorldId Redo = MakeWorld();
 		b3World_EnableWarmStarting(Redo, bWarmStarting);
 		TArray<b3BodyId> RedoBodies;
@@ -215,6 +193,8 @@ namespace
 
 	void RunSnapshotTest()
 	{
+		const Box3D::FScopedLengthUnits Units(1.0f); // see RunDeterminismTest
+
 		UE_LOG(LogBox3D, Log, TEXT("box3d.SnapshotTest: snapshot at frame %d, compare %d-frame tail (restore vs. reference)."),
 			SnapshotFrame, TestFrames - SnapshotFrame);
 		RunSnapshotTestOnce(/*bWarmStarting=*/true);
