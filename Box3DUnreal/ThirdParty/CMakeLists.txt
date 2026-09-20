@@ -17,7 +17,10 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 # target, but our consumer is UnrealBuildTool, not CMake, so Box3DUnreal.Build.cs
 # defines BOX3D_DOUBLE_PRECISION on the module too. Both MUST agree or box3d's
 # ABI-mismatch link guard (the b3CreateWorld macro) trips on purpose.
-set(BOX3D_DOUBLE_PRECISION ON CACHE BOOL "" FORCE)
+# Default only, not FORCE: configuring this project by hand with
+# -DBOX3D_DOUBLE_PRECISION=OFF produces a single-precision library for a pre-built
+# drop (tell the module with BOX3D_PREBUILT_PRECISION=float).
+set(BOX3D_DOUBLE_PRECISION ON CACHE BOOL "Store box3d translation as double")
 
 add_subdirectory(box3d)
 

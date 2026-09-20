@@ -13,8 +13,6 @@ DEFINE_LOG_CATEGORY(LogBox3D);
 
 void FBox3DUnrealModule::StartupModule()
 {
-	// -DisableBox3D on the launch command line seeds the master switch off. box3d.Enabled
-	// is a static cvar constructed before this runs, so it's already registered here.
 	if (FParse::Param(FCommandLine::Get(), TEXT("DisableBox3D")))
 	{
 		if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("box3d.Enabled")))
