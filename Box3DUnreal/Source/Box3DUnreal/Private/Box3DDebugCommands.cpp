@@ -1,11 +1,9 @@
 // Author: Antonio Lattanzio - emptyvessel
 
-// Demo/debug helpers: console commands that pour a heap of box3d bodies in front of the
-// player and fire the spatial queries from the player's view. Purpose-built for capturing
-// the convex pour + debug wireframe reveal and for eyeballing query results; not part of
-// the runtime API.
 
 #include "Box3DBodyComponent.h"
+#include "Box3DCharacterPawn.h"
+#include "Box3DJointDemoActor.h"
 #include "Box3DSubsystem.h"
 #include "Box3DLog.h"
 #include "Components/StaticMeshComponent.h"
@@ -19,8 +17,6 @@
 
 namespace
 {
-	// Asset path of the mesh to pour. Empty -> engine fallback. Point this at a prop with
-	// simple CONVEX collision so box3d.Spawn's convex shape has a hull to build.
 	TAutoConsoleVariable<FString> CVarSpawnMesh(
 		TEXT("box3d.SpawnMesh"),
 		TEXT(""),
@@ -59,8 +55,6 @@ namespace
 		TEXT("Uniform scale applied to each spawned prop."),
 		ECVF_Default);
 
-	// A visible engine mesh so the command still does something when SpawnMesh is unset.
-	// Cone has simple collision, so the convex path still exercises (a coarse hull).
 	constexpr const TCHAR* FallbackMeshPath = TEXT("/Engine/BasicShapes/Cone.Cone");
 
 	UStaticMesh* ResolveSpawnMesh()
@@ -173,8 +167,6 @@ namespace
 		Fwd = Fwd.GetSafeNormal();
 		const FVector Centre = RefLocation + Fwd * Forward + FVector(0, 0, Height);
 
-		// Stagger height per prop so they fall as a stream and settle into a pile rather
-		// than exploding out of a shared spawn point. Random spin varies how hulls land.
 		for (int32 i = 0; i < Count; ++i)
 		{
 			const FVector2D Disk = FMath::RandPointInCircle(Spread);
@@ -193,9 +185,6 @@ namespace
 		TEXT("box3d.SpawnMesh / SpawnShape / SpawnHeight / SpawnForward / SpawnSpread / SpawnScale."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&SpawnPour));
 
-	// --- Query smoke tests -------------------------------------------------------------
-	// Fire the subsystem's queries from the player's viewpoint and draw what came back.
-	// The draws persist ~5s so the result can be inspected after the call.
 
 	constexpr float QueryDrawSeconds = 5.0f;
 
@@ -284,9 +273,6 @@ namespace
 		TEXT("Sphere-overlap the box3d world around the player (default radius 500cm) and list the actors."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&QueryOverlap));
 
-	// Print the live world's state hash (doc §14). Run it on server and client with the sim paused
-	// (pause box3d.Enabled or the game) to eyeball a desync; the number is stable for a given build
-	// and scenario. Cross-machine comparison still needs a shared body ordering (a D2 concern).
 	void HashState(UWorld* World)
 	{
 		UBox3DSubsystem* Subsystem = GetQuerySubsystem(World, TEXT("box3d.HashState"));
@@ -304,4 +290,91 @@ namespace
 		TEXT("box3d.HashState"),
 		TEXT("Print the djb2 state hash of the live world's dynamic bodies (determinism / desync check)."),
 		FConsoleCommandWithWorldDelegate::CreateStatic(&HashState));
+
+	// --- Joint demos -------------------------------------------------------------------
+
+	void SpawnJointDemo(const TArray<FString>& Args, UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		EBox3DJointDemo Demo = EBox3DJointDemo::Chain;
+		if (Args.Num() > 0)
+		{
+			const FString& Name = Args[0];
+			if (Name.Equals(TEXT("bridge"), ESearchCase::IgnoreCase))      Demo = EBox3DJointDemo::Bridge;
+			else if (Name.Equals(TEXT("newton"), ESearchCase::IgnoreCase)) Demo = EBox3DJointDemo::Newton;
+			else if (Name.Equals(TEXT("motor"), ESearchCase::IgnoreCase))  Demo = EBox3DJointDemo::Motor;
+		}
+
+		// Place it in front of the player, high enough that a chain can hang clear.
+		FVector Location = FVector::ZeroVector;
+		FRotator Rotation = FRotator::ZeroRotator;
+		if (GetPlayerReference(World, Location, Rotation))
+		{
+			Location += Rotation.Vector() * 500.0 + FVector(0.0, 0.0, 600.0);
+		}
+
+		const FTransform Xform(Location);
+		ABox3DJointDemoActor* Actor = World->SpawnActorDeferred<ABox3DJointDemoActor>(
+			ABox3DJointDemoActor::StaticClass(), Xform, nullptr, nullptr,
+			ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+		if (Actor == nullptr)
+		{
+			return;
+		}
+
+		if (Args.Num() > 1)
+		{
+			Actor->LinkCount = FMath::Clamp(FCString::Atoi(*Args[1]), 2, 64);
+		}
+		Actor->Demo = Demo;
+		Actor->FinishSpawning(Xform);
+
+		UE_LOG(LogBox3D, Log, TEXT("box3d.JointDemo: spawned demo %d at %s."),
+			static_cast<int32>(Demo), *Location.ToCompactString());
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GBox3DJointDemoCommand(
+		TEXT("box3d.JointDemo"),
+		TEXT("Spawn a joint demo in front of the player: chain | bridge | newton | motor [links]."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&SpawnJointDemo));
+
+	// --- Character ---------------------------------------------------------------------
+
+	void SpawnCharacter(UWorld* World)
+	{
+		APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+		if (PC == nullptr)
+		{
+			return;
+		}
+
+		FVector Location = FVector::ZeroVector;
+		FRotator Rotation = FRotator::ZeroRotator;
+		GetPlayerReference(World, Location, Rotation);
+		Location += FVector(0.0, 0.0, 100.0); // clear of the floor so the spring settles
+
+		FActorSpawnParameters Params;
+		Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+		ABox3DCharacterPawn* Pawn = World->SpawnActor<ABox3DCharacterPawn>(
+			ABox3DCharacterPawn::StaticClass(), FTransform(Rotation, Location), Params);
+		if (Pawn == nullptr)
+		{
+			return;
+		}
+
+		PC->Possess(Pawn);
+		UE_LOG(LogBox3D, Log, TEXT("box3d.CharacterDemo: possessed a box3d character at %s. ")
+			TEXT("Needs MoveForward/MoveRight/Turn/LookUp axes and a Jump action bound."),
+			*Location.ToCompactString());
+	}
+
+	FAutoConsoleCommandWithWorld GBox3DCharacterDemoCommand(
+		TEXT("box3d.CharacterDemo"),
+		TEXT("Spawn and possess a box3d kinematic character at the player's location."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(&SpawnCharacter));
 } // namespace
