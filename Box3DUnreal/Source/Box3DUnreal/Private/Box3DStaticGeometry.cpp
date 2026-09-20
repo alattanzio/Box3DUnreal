@@ -31,8 +31,6 @@ namespace Box3D::StaticGeometry
 
 		FORCEINLINE b3Vec3 ToB3(const FVector3f& V) { return b3Vec3{ V.X, V.Y, V.Z }; }
 
-		// UE and box3d use opposite front-face winding; the negate-Y flip already reconciles
-		// them, so only a mirrored (negative) scale needs reversing. bInvert = manual override.
 		FORCEINLINE bool ShouldReverseWinding(const FVector& Scale, bool bInvert)
 		{
 			const bool bNegativeScale = (Scale.X * Scale.Y * Scale.Z) < 0.0;
@@ -58,8 +56,6 @@ namespace Box3D::StaticGeometry
 
 		// --- Stage 1 helpers: UE collision -> FBox3DBakedShape (box3d local space) ---------
 
-		// Append a hull shape from a point cloud (cm). Scale is baked in. Rejects clouds that
-		// don't form a valid hull (b3CreateHull is the same builder used at load).
 		bool AppendHull(TArray<FBox3DBakedShape>& OutShapes, const TArray<FVector>& Points, const FVector& Scale)
 		{
 			if (Points.Num() < 4)
@@ -164,8 +160,6 @@ namespace Box3D::StaticGeometry
 			return Created;
 		}
 
-		// Complex collision: cooked tri-mesh -> a single baked Mesh shape (verts + indices,
-		// winding corrected). box3d rebuilds the b3Mesh at load.
 		bool ExtractComplexTriMesh(
 			IInterface_CollisionDataProvider* Provider, const FVector& Scale, bool bInvertWinding,
 			TArray<FBox3DBakedShape>& OutShapes)

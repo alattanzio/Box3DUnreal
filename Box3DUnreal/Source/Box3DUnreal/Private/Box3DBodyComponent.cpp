@@ -27,10 +27,8 @@ namespace
 			static_cast<float>(V.Z * Scale.Z * Box3D::UnrealToMeters) };
 	}
 
-	// Gather the mesh's simple convex/box collision as box3d-space point clouds, one per
-	// element. Scale is baked in (box3d shapes carry none). Convex hulls from render verts
-	// are wrong; this uses the cooked simple collision (doc §7).
-	void GatherConvexPointClouds(UPrimitiveComponent* Prim, const FVector& Scale, TArray<TArray<b3Vec3>>& OutClouds)
+	void GatherPrimitiveClouds(UPrimitiveComponent* Prim, const FTransform& SourceToRoot,
+		const FVector& RootScale, TArray<TArray<b3Vec3>>& OutClouds)
 	{
 		UBodySetup* Setup = Prim ? Prim->GetBodySetup() : nullptr;
 		if (Setup == nullptr)
@@ -52,7 +50,7 @@ namespace
 			Cloud.Reserve(Convex.VertexData.Num());
 			for (const FVector& V : Convex.VertexData)
 			{
-				Cloud.Add(ConvexLocalToBox3D(ElemTM.TransformPosition(V), Scale));
+				Cloud.Add(ConvexLocalToBox3D(SourceToRoot.TransformPosition(ElemTM.TransformPosition(V)), RootScale));
 			}
 		}
 
@@ -67,8 +65,44 @@ namespace
 			for (int32 Sy = -1; Sy <= 1; Sy += 2)
 			for (int32 Sz = -1; Sz <= 1; Sz += 2)
 			{
-				Cloud.Add(ConvexLocalToBox3D(ElemTM.TransformPosition(FVector(Sx * He.X, Sy * He.Y, Sz * He.Z)), Scale));
+				const FVector Corner(Sx * He.X, Sy * He.Y, Sz * He.Z);
+				Cloud.Add(ConvexLocalToBox3D(SourceToRoot.TransformPosition(ElemTM.TransformPosition(Corner)), RootScale));
 			}
+		}
+	}
+
+	void GatherConvexPointClouds(USceneComponent* Root, bool bIncludeChildren,
+		TArray<TArray<b3Vec3>>& OutClouds)
+	{
+		if (Root == nullptr)
+		{
+			return;
+		}
+
+		const FVector RootScale = Root->GetComponentScale();
+		if (UPrimitiveComponent* RootPrim = Cast<UPrimitiveComponent>(Root))
+		{
+			GatherPrimitiveClouds(RootPrim, FTransform::Identity, RootScale, OutClouds);
+		}
+
+		if (!bIncludeChildren)
+		{
+			return;
+		}
+
+		TArray<USceneComponent*> Children;
+		Root->GetChildrenComponents(/*bIncludeAllDescendants=*/true, Children);
+
+		const FTransform RootTM = Root->GetComponentTransform();
+		for (USceneComponent* Child : Children)
+		{
+			UPrimitiveComponent* ChildPrim = Cast<UPrimitiveComponent>(Child);
+			if (ChildPrim == nullptr || ChildPrim->GetCollisionEnabled() == ECollisionEnabled::NoCollision)
+			{
+				continue;
+			}
+			GatherPrimitiveClouds(ChildPrim, ChildPrim->GetComponentTransform().GetRelativeTransform(RootTM),
+				RootScale, OutClouds);
 		}
 	}
 } // namespace
@@ -89,16 +123,15 @@ void UBox3DBodyComponent::BeginPlay()
 		return;
 	}
 
-	// Resolve the box extent now so debug draw works even on clients, which create
-	// no body but still show the replicated actor pose. Convex resolves it too as the
-	// fallback box used when the mesh has no simple convex collision.
 	if (Shape == EBox3DShape::Box)
 	{
+		// Author-specified extents are centred on the body origin by definition.
 		ResolvedHalfExtent = BoxHalfExtent.GetAbs();
+		ResolvedBoxCenter = FVector::ZeroVector;
 	}
 	else if (Shape == EBox3DShape::Auto || Shape == EBox3DShape::Convex)
 	{
-		ResolvedHalfExtent = ComputeAutoBoxHalfExtent();
+		ResolveAutoBoxBounds();
 	}
 
 	// Cache the convex wireframe on both server and client so both can draw the shape.
@@ -110,12 +143,8 @@ void UBox3DBodyComponent::BeginPlay()
 	// Register for debug draw in every world (server and client).
 	Subsystem->RegisterBody(this);
 
-	// Resolve net-role eligibility once. It doesn't depend on the master switch or world
-	// validity, so a runtime 'box3d.Enabled 1' can still build this body later.
 	bSimulationEligible = ComputeSimulationEligibility();
 
-	// Build the body now unless box3d is globally disabled; if it is, the subsystem
-	// rebuilds every eligible body when the switch is turned back on.
 	if (bSimulationEligible && UBox3DSubsystem::IsBox3DEnabled())
 	{
 		RebuildSimulationBody();
@@ -124,11 +153,6 @@ void UBox3DBodyComponent::BeginPlay()
 
 bool UBox3DBodyComponent::ComputeSimulationEligibility()
 {
-	// Only the authority simulates; a client displays replicated poses. HasAuthority() is
-	// the per-actor gate, but it only tells server from client when the actor is
-	// REPLICATED - a non-replicated actor reports authority on every instance, so each
-	// would run its own (diverging) body. The explicit NM_Client block catches pure
-	// clients regardless; the warning below flags the remaining hole (level actors).
 	AActor* Owner = GetOwner();
 	const ENetMode NetMode = GetWorld()->GetNetMode();
 	if (Owner == nullptr || NetMode == NM_Client || !Owner->HasAuthority())
@@ -136,8 +160,6 @@ bool UBox3DBodyComponent::ComputeSimulationEligibility()
 		return false;
 	}
 
-	// Level-placed actors can't be fixed by runtime SetReplicates - the client instance
-	// already began play as authority and will simulate a duplicate. Must be set in editor.
 	if (NetMode != NM_Standalone && Owner->IsNetStartupActor() && !Owner->GetIsReplicated())
 	{
 		UE_LOG(LogBox3D, Warning,
@@ -151,12 +173,12 @@ bool UBox3DBodyComponent::ComputeSimulationEligibility()
 
 void UBox3DBodyComponent::RebuildSimulationBody()
 {
-	// Idempotent: skip if a body already exists, the role is ineligible, or the world
-	// isn't up (e.g. box3d still disabled). The subsystem calls this on a runtime enable.
 	if (B3_IS_NON_NULL(BodyId) || !bSimulationEligible || Subsystem == nullptr || !Subsystem->IsWorldValid())
 	{
 		return;
 	}
+
+	Subsystem->FlushAsyncStep();
 
 	CreateBody();
 	if (B3_IS_NULL(BodyId))
@@ -164,12 +186,16 @@ void UBox3DBodyComponent::RebuildSimulationBody()
 		return;
 	}
 
+	if (bIsSensor && BodyType == EBox3DBodyType::Dynamic)
+	{
+		UE_LOG(LogBox3D, Warning,
+			TEXT("%s: a trigger never collides, so this Dynamic body will fall through the level. ")
+			TEXT("Use Static or Kinematic."),
+			*GetNameSafe(GetOwner()));
+	}
+
 	AddShape();
 
-	// Dynamic and kinematic both move at runtime and must stream to clients. The
-	// authority contract (Chaos off, Movable) matters for BOTH: with Chaos simulating,
-	// SetReplicateMovement flips into physics-state replication, which expects the client
-	// to simulate - so the client, which never does, would never follow the server.
 	if (BodyType == EBox3DBodyType::Dynamic || BodyType == EBox3DBodyType::Kinematic)
 	{
 		EnforceAuthorityContract();
@@ -178,6 +204,18 @@ void UBox3DBodyComponent::RebuildSimulationBody()
 		if (BodyType == EBox3DBodyType::Dynamic)
 		{
 			Subsystem->RegisterDynamicBody(this);   // box3d writes the actor each step
+
+			// Flush any force/velocity requested before the body existed.
+			if (!PendingLinearImpulse.IsNearlyZero())
+			{
+				AddImpulse(PendingLinearImpulse, /*bWake=*/true);
+				PendingLinearImpulse = FVector::ZeroVector;
+			}
+			if (bHasPendingAngularVelocity)
+			{
+				SetAngularVelocity(PendingAngularVelocity, /*bWake=*/true);
+				bHasPendingAngularVelocity = false;
+			}
 		}
 		else
 		{
@@ -186,11 +224,246 @@ void UBox3DBodyComponent::RebuildSimulationBody()
 	}
 }
 
+void UBox3DBodyComponent::FenceAsyncStep() const
+{
+	if (Subsystem != nullptr)
+	{
+		Subsystem->FlushAsyncStep();
+	}
+}
+
+void UBox3DBodyComponent::AddImpulse(const FVector& Impulse, bool bWake)
+{
+	if (BodyType != EBox3DBodyType::Dynamic)
+	{
+		return;
+	}
+	if (B3_IS_NULL(BodyId))
+	{
+		PendingLinearImpulse += Impulse; // apply once the body is built
+		return;
+	}
+	FenceAsyncStep();
+	b3Body_ApplyLinearImpulseToCenter(BodyId, Box3D::ToBox3DVector(Impulse), bWake);
+}
+
+void UBox3DBodyComponent::AddImpulseAtLocation(const FVector& Impulse, const FVector& WorldLocation, bool bWake)
+{
+	if (BodyType != EBox3DBodyType::Dynamic || B3_IS_NULL(BodyId))
+	{
+		return; // not queued: the world point would be stale by the time the body exists
+	}
+	FenceAsyncStep();
+	b3Body_ApplyLinearImpulse(BodyId, Box3D::ToBox3DVector(Impulse),
+		Box3D::ToBox3DPosition(WorldLocation), bWake);
+}
+
+void UBox3DBodyComponent::AddForce(const FVector& Force, bool bWake)
+{
+	if (BodyType != EBox3DBodyType::Dynamic || B3_IS_NULL(BodyId))
+	{
+		return; // not queued: a force lasts one step, so it would land at the wrong time
+	}
+	FenceAsyncStep();
+	b3Body_ApplyForceToCenter(BodyId, Box3D::ToBox3DVector(Force), bWake);
+}
+
+void UBox3DBodyComponent::AddTorque(const FVector& Torque, bool bWake)
+{
+	if (BodyType != EBox3DBodyType::Dynamic || B3_IS_NULL(BodyId))
+	{
+		return;
+	}
+	// N*m = kg*m^2/s^2, so the length factor applies twice.
+	const float TorqueToBox3D = static_cast<float>(Box3D::UnrealToMeters * Box3D::UnrealToMeters);
+	FenceAsyncStep();
+	b3Body_ApplyTorque(BodyId, b3MulSV(TorqueToBox3D, Box3D::ToBox3DAngular(Torque)), bWake);
+}
+
+void UBox3DBodyComponent::AddAngularImpulse(const FVector& AngularImpulse, bool bWake)
+{
+	if (BodyType != EBox3DBodyType::Dynamic || B3_IS_NULL(BodyId))
+	{
+		return;
+	}
+	// Same squared length factor as torque.
+	const float ImpulseToBox3D = static_cast<float>(Box3D::UnrealToMeters * Box3D::UnrealToMeters);
+	FenceAsyncStep();
+	b3Body_ApplyAngularImpulse(BodyId, b3MulSV(ImpulseToBox3D, Box3D::ToBox3DAngular(AngularImpulse)), bWake);
+}
+
+void UBox3DBodyComponent::SetLinearVelocity(const FVector& Velocity, bool bWake)
+{
+	if (BodyType != EBox3DBodyType::Dynamic || B3_IS_NULL(BodyId))
+	{
+		return;
+	}
+	FenceAsyncStep();
+	b3Body_SetLinearVelocity(BodyId, Box3D::ToBox3DVector(Velocity));
+	if (bWake)
+	{
+		b3Body_SetAwake(BodyId, true);
+	}
+}
+
+void UBox3DBodyComponent::SetAngularVelocity(const FVector& AngularVelocity, bool bWake)
+{
+	if (BodyType != EBox3DBodyType::Dynamic)
+	{
+		return;
+	}
+	if (B3_IS_NULL(BodyId))
+	{
+		PendingAngularVelocity = AngularVelocity;
+		bHasPendingAngularVelocity = true;
+		return;
+	}
+	// Axial, and rad/s is scale-free - no cm<->m factor here.
+	FenceAsyncStep();
+	b3Body_SetAngularVelocity(BodyId, Box3D::ToBox3DAngular(AngularVelocity));
+	if (bWake)
+	{
+		b3Body_SetAwake(BodyId, true);
+	}
+}
+
+void UBox3DBodyComponent::SetGravityScale(float Scale)
+{
+	if (B3_IS_NON_NULL(BodyId))
+	{
+		FenceAsyncStep();
+		b3Body_SetGravityScale(BodyId, Scale);
+		b3Body_SetAwake(BodyId, true); // a resting body would ignore the change
+	}
+}
+
+void UBox3DBodyComponent::SetSleepEnabled(bool bEnabled)
+{
+	if (B3_IS_NON_NULL(BodyId))
+	{
+		FenceAsyncStep();
+		b3Body_EnableSleep(BodyId, bEnabled);
+	}
+}
+
+void UBox3DBodyComponent::TeleportBody(const FVector& Location, const FRotator& Rotation)
+{
+	if (B3_IS_NULL(BodyId))
+	{
+		return;
+	}
+
+	const FQuat Quat = Rotation.Quaternion();
+	FenceAsyncStep();
+	b3Body_SetTransform(BodyId, Box3D::ToBox3DPosition(Location), Box3D::ToBox3DQuat(Quat));
+	b3Body_SetLinearVelocity(BodyId, b3Vec3_zero);
+	b3Body_SetAngularVelocity(BodyId, b3Vec3_zero);
+	b3Body_SetAwake(BodyId, true);
+
+	PrevTransform = CurrTransform = FTransform(Quat, Location, SpawnScale);
+	GetOwner()->SetActorLocationAndRotation(Location, Quat, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+}
+
+FVector UBox3DBodyComponent::GetLinearVelocity() const
+{
+	if (B3_IS_NULL(BodyId))
+	{
+		return FVector::ZeroVector;
+	}
+	FenceAsyncStep();
+	return Box3D::FromBox3DVector(b3Body_GetLinearVelocity(BodyId));
+}
+
+FVector UBox3DBodyComponent::GetAngularVelocity() const
+{
+	if (B3_IS_NULL(BodyId))
+	{
+		return FVector::ZeroVector;
+	}
+	FenceAsyncStep();
+	return Box3D::FromBox3DAngular(b3Body_GetAngularVelocity(BodyId));
+}
+
+float UBox3DBodyComponent::GetBodyMass() const
+{
+	if (B3_IS_NULL(BodyId))
+	{
+		return 0.0f;
+	}
+	FenceAsyncStep();
+	return b3Body_GetMass(BodyId);
+}
+
+bool UBox3DBodyComponent::IsBodyAwake() const
+{
+	if (B3_IS_NULL(BodyId))
+	{
+		return false;
+	}
+	FenceAsyncStep();
+	return b3Body_IsAwake(BodyId);
+}
+
+void UBox3DBodyComponent::WakeBody()
+{
+	if (B3_IS_NON_NULL(BodyId))
+	{
+		FenceAsyncStep();
+		b3Body_SetAwake(BodyId, true);
+	}
+}
+
+void UBox3DBodyComponent::RebuildShapes()
+{
+	if (B3_IS_NULL(BodyId))
+	{
+		return;
+	}
+
+	if (Subsystem != nullptr)
+	{
+		Subsystem->FlushAsyncStep();
+	}
+
+	const int32 Count = b3Body_GetShapeCount(BodyId);
+	if (Count > 0)
+	{
+		TArray<b3ShapeId> Shapes;
+		Shapes.SetNumUninitialized(Count);
+		const int32 Fetched = b3Body_GetShapes(BodyId, Shapes.GetData(), Count);
+		for (int32 i = 0; i < Fetched; ++i)
+		{
+			// Defer the mass update to the single ApplyMassFromShapes below.
+			b3DestroyShape(Shapes[i], /*updateBodyMass=*/false);
+		}
+	}
+
+	// Static bodies may hold tri-mesh data referenced by the shapes we just destroyed.
+	for (b3MeshData* Mesh : OwnedMeshes)
+	{
+		if (Mesh != nullptr)
+		{
+			b3DestroyMesh(Mesh);
+		}
+	}
+	OwnedMeshes.Reset();
+
+	if (Shape == EBox3DShape::Auto || Shape == EBox3DShape::Convex)
+	{
+		ResolveAutoBoxBounds();
+	}
+	if (Shape == EBox3DShape::Convex)
+	{
+		BuildConvexDebugGeometry();
+	}
+
+	AddShape();
+	b3Body_ApplyMassFromShapes(BodyId);
+	b3Body_SetAwake(BodyId, true);
+}
+
 void UBox3DBodyComponent::TeardownSimulationBody()
 {
-	// Hand the actor back to its native Chaos physics so a runtime disable is a true
-	// "without box3d", not a frozen pose. Only actors box3d actually took over (dynamic/
-	// kinematic, and only those that were simulating) get restored.
 	if (bRestoreChaosSimulation)
 	{
 		if (UPrimitiveComponent* Root = Cast<UPrimitiveComponent>(GetOwner()->GetRootComponent()))
@@ -200,8 +473,6 @@ void UBox3DBodyComponent::TeardownSimulationBody()
 		bRestoreChaosSimulation = false;
 	}
 
-	// Destroy the box3d body but stay registered (subsystem keeps us in AllBodies) so a
-	// later 'box3d.Enabled 1' rebuilds. DestroyBody nulls BodyId and frees owned meshes.
 	DestroyBody();
 }
 
@@ -213,8 +484,6 @@ void UBox3DBodyComponent::EnableReplication()
 		return; // single-player: nothing to replicate
 	}
 
-	// Replication is an actor-level flag (no component checkbox). We're on the authority
-	// here, so enable it if the author didn't, then let UE stream the transform to clients.
 	if (!Owner->GetIsReplicated())
 	{
 		Owner->SetReplicates(true);
@@ -255,20 +524,27 @@ void UBox3DBodyComponent::CreateBody()
 	Def.linearDamping = LinearDamping;
 	Def.angularDamping = AngularDamping;
 
-	// Lets a query hit resolve back to the actor. Safe because DestroyBody runs on EndPlay,
-	// so the body never outlives the owner.
 	Def.userData = GetOwner();
 
 	BodyId = b3CreateBody(Subsystem->GetWorldId(), &Def);
+	bWasAwake = true; // bodies are created awake
 }
 
 void UBox3DBodyComponent::AddShape()
 {
 	b3ShapeDef ShapeDef = b3DefaultShapeDef();
-	ShapeDef.density = Density;
+	ShapeDef.density = Box3D::ToBox3DDensity(Density);
 	ShapeDef.baseMaterial.friction = Friction;
 	ShapeDef.baseMaterial.restitution = Restitution;
 	ShapeDef.baseMaterial.rollingResistance = RollingResistance;
+
+	ShapeDef.userData = this;
+
+	// A trigger with overlaps off would report nothing, so force it on there.
+	ShapeDef.isSensor = bIsSensor;
+	ShapeDef.enableSensorEvents = bIsSensor || bGenerateSensorEvents;
+	ShapeDef.enableContactEvents = bGenerateContactEvents;
+	ShapeDef.enableHitEvents = bGenerateHitEvents;
 
 	// Opt-in collision filtering; 0/0/0 leaves the default (collide with everything).
 	if (CollisionCategory != 0 || CollisionMask != 0 || CollisionGroup != 0)
@@ -286,8 +562,6 @@ void UBox3DBodyComponent::AddShape()
 		ShapeDef.filter = Filter;
 	}
 
-	// Static bodies mirror the actor's cooked collision; fall through to a primitive
-	// Shape only if extraction finds nothing.
 	if (BodyType == EBox3DBodyType::Static)
 	{
 		const auto Source = static_cast<Box3D::StaticGeometry::ESource>(StaticSource);
@@ -311,8 +585,6 @@ void UBox3DBodyComponent::AddShape()
 	}
 	case EBox3DShape::Capsule:
 	{
-		// Capsule along the actor's local Z. Z maps straight through (only Y is
-		// negated for handedness), so it stands upright in Unreal.
 		const float HalfH = HalfHeight * M;
 		b3Capsule Capsule;
 		Capsule.center1 = b3Vec3{ 0.0f, 0.0f, +HalfH };
@@ -328,19 +600,21 @@ void UBox3DBodyComponent::AddShape()
 			break;
 		}
 		UE_LOG(LogBox3D, Warning,
-			TEXT("%s: Convex shape found no simple convex collision; falling back to a box. ")
-			TEXT("Add convex simple collision to the mesh, or use a different shape."),
+			TEXT("%s: Convex shape resolved no usable hull from the root's simple collision; ")
+			TEXT("falling back to a bounds box. Add convex simple collision to the mesh (a hull ")
+			TEXT("needs 4+ non-coplanar verts), or use a different shape."),
 			*GetNameSafe(GetOwner()));
-		const b3BoxHull FallbackHull = b3MakeBoxHull(
-			ResolvedHalfExtent.X * M, ResolvedHalfExtent.Y * M, ResolvedHalfExtent.Z * M);
+		const b3BoxHull FallbackHull = b3MakeOffsetBoxHull(
+			ResolvedHalfExtent.X * M, ResolvedHalfExtent.Y * M, ResolvedHalfExtent.Z * M,
+			Box3D::ToBox3DVector(ResolvedBoxCenter));
 		b3CreateHullShape(BodyId, &ShapeDef, &FallbackHull.base);
 		break;
 	}
 	default: // Auto / Box
 	{
-		// ResolvedHalfExtent was computed in BeginPlay (also used by debug draw).
-		const b3BoxHull Hull = b3MakeBoxHull(
-			ResolvedHalfExtent.X * M, ResolvedHalfExtent.Y * M, ResolvedHalfExtent.Z * M);
+		const b3BoxHull Hull = b3MakeOffsetBoxHull(
+			ResolvedHalfExtent.X * M, ResolvedHalfExtent.Y * M, ResolvedHalfExtent.Z * M,
+			Box3D::ToBox3DVector(ResolvedBoxCenter));
 		b3CreateHullShape(BodyId, &ShapeDef, &Hull.base);
 		break;
 	}
@@ -349,14 +623,8 @@ void UBox3DBodyComponent::AddShape()
 
 bool UBox3DBodyComponent::AddConvexShapes(const b3ShapeDef& ShapeDef)
 {
-	UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(GetOwner()->GetRootComponent());
-	if (Prim == nullptr)
-	{
-		return false;
-	}
-
 	TArray<TArray<b3Vec3>> Clouds;
-	GatherConvexPointClouds(Prim, Prim->GetComponentScale(), Clouds);
+	GatherConvexPointClouds(GetOwner()->GetRootComponent(), bConvexIncludesAttachedChildren, Clouds);
 
 	// One hull shape per element (a compound), matching the mesh's simple collision.
 	int32 Created = 0;
@@ -383,18 +651,9 @@ void UBox3DBodyComponent::BuildConvexDebugGeometry()
 {
 	ConvexDebugSegments.Reset();
 
-	UPrimitiveComponent* Prim = Cast<UPrimitiveComponent>(GetOwner()->GetRootComponent());
-	if (Prim == nullptr)
-	{
-		return;
-	}
-
 	TArray<TArray<b3Vec3>> Clouds;
-	GatherConvexPointClouds(Prim, Prim->GetComponentScale(), Clouds);
+	GatherConvexPointClouds(GetOwner()->GetRootComponent(), bConvexIncludesAttachedChildren, Clouds);
 
-	// Rebuild each hull just to read back its computed edges - b3CreateHull is a standalone
-	// utility (no world), so this runs on clients too. Emit each undirected edge once by
-	// only taking the half-edge whose index is below its twin.
 	for (const TArray<b3Vec3>& Cloud : Clouds)
 	{
 		if (Cloud.Num() < 4)
@@ -428,10 +687,9 @@ void UBox3DBodyComponent::BuildConvexDebugGeometry()
 
 void UBox3DBodyComponent::DestroyBody()
 {
-	// Only touch box3d while the world still exists (component EndPlay precedes
-	// subsystem Deinitialize, but guard anyway).
 	if (B3_IS_NON_NULL(BodyId) && Subsystem != nullptr && Subsystem->IsWorldValid())
 	{
+		Subsystem->FlushAsyncStep();
 		b3DestroyBody(BodyId);
 	}
 	BodyId = b3_nullBodyId;
@@ -455,8 +713,6 @@ void UBox3DBodyComponent::EnforceAuthorityContract()
 		return;
 	}
 
-	// box3d is the sole mover; make sure Chaos isn't also simulating this actor. Remember
-	// the prior state so a runtime disable can hand the actor back (see TeardownSimulationBody).
 	bRestoreChaosSimulation = Root->IsSimulatingPhysics();
 	Root->SetSimulatePhysics(false);
 
@@ -468,23 +724,46 @@ void UBox3DBodyComponent::EnforceAuthorityContract()
 	}
 }
 
-FVector UBox3DBodyComponent::ComputeAutoBoxHalfExtent() const
+void UBox3DBodyComponent::ResolveAutoBoxBounds()
 {
-	if (const UPrimitiveComponent* Root = Cast<UPrimitiveComponent>(GetOwner()->GetRootComponent()))
+	ResolvedHalfExtent = FVector(50.0, 50.0, 50.0);
+	ResolvedBoxCenter = FVector::ZeroVector;
+
+	USceneComponent* Root = GetOwner()->GetRootComponent();
+	if (Root != nullptr)
 	{
-		// Local-space bounds (Identity transform) times the component scale gives
-		// axis-aligned half-extents in the actor's frame, independent of rotation.
-		const FBoxSphereBounds LocalBounds = Root->CalcBounds(FTransform::Identity);
-		const FVector Extent = LocalBounds.BoxExtent * Root->GetComponentScale();
-		if (!Extent.IsNearlyZero())
+		const FVector Scale = Root->GetComponentScale();
+		const FTransform RootTM = Root->GetComponentTransform();
+
+		FBox Local(ForceInit);
+		if (const UPrimitiveComponent* RootPrim = Cast<UPrimitiveComponent>(Root))
 		{
-			return Extent;
+			Local += RootPrim->CalcBounds(FTransform::Identity).GetBox();
+		}
+
+		if (bConvexIncludesAttachedChildren || !Root->IsA<UPrimitiveComponent>())
+		{
+			TArray<USceneComponent*> Children;
+			Root->GetChildrenComponents(/*bIncludeAllDescendants=*/true, Children);
+			for (USceneComponent* Child : Children)
+			{
+				if (const UPrimitiveComponent* ChildPrim = Cast<UPrimitiveComponent>(Child))
+				{
+					Local += ChildPrim->CalcBounds(ChildPrim->GetComponentTransform().GetRelativeTransform(RootTM)).GetBox();
+				}
+			}
+		}
+
+		if (Local.IsValid && !Local.GetExtent().IsNearlyZero())
+		{
+			ResolvedHalfExtent = Local.GetExtent() * Scale;
+			ResolvedBoxCenter = Local.GetCenter() * Scale;
+			return;
 		}
 	}
 
 	UE_LOG(LogBox3D, Warning, TEXT("%s: could not derive Auto bounds; using 50cm default."),
 		*GetNameSafe(GetOwner()));
-	return FVector(50.0, 50.0, 50.0);
 }
 
 void UBox3DBodyComponent::CaptureStepTransform()
@@ -492,6 +771,17 @@ void UBox3DBodyComponent::CaptureStepTransform()
 	if (B3_IS_NULL(BodyId))
 	{
 		return;
+	}
+
+	// box3d has no wake event, so poll it here - we already visit every body each step.
+	if (bGenerateSleepEvents)
+	{
+		const bool bAwake = b3Body_IsAwake(BodyId);
+		if (bAwake != bWasAwake)
+		{
+			bWasAwake = bAwake;
+			Subsystem->QueueSleepEvent(this, bAwake);
+		}
 	}
 
 	FTransform NewXform = Box3D::FromBox3DTransform(b3Body_GetTransform(BodyId));
@@ -522,8 +812,6 @@ void UBox3DBodyComponent::PushKinematicTarget(float TimeStep)
 		return;
 	}
 
-	// Gameplay owns the actor pose; set the velocity that reaches it so contacts carry
-	// resting dynamics (a raw SetTransform teleport imparts no momentum).
 	const FTransform T = GetOwner()->GetActorTransform();
 	b3WorldTransform Target;
 	Target.p = Box3D::ToBox3DPosition(T.GetLocation());
@@ -540,9 +828,6 @@ void UBox3DBodyComponent::DrawDebug() const
 		return;
 	}
 
-	// Draw at the owning actor's exact current transform. On the server box3d wrote
-	// it this frame; on a client it is the replicated pose. Either way the wireframe
-	// sits on the mesh - and a client box that moves proves replication is working.
 	const FTransform T = Owner->GetActorTransform();
 	const FVector Location = T.GetLocation();
 	const FQuat Rotation = T.GetRotation();
@@ -567,8 +852,6 @@ void UBox3DBodyComponent::DrawDebug() const
 	case EBox3DShape::Convex:
 		if (ConvexDebugSegments.Num() >= 2)
 		{
-			// Segments are body-local (scale baked); the body carries no scale, so place
-			// them with rotation + translation only.
 			for (int32 i = 0; i + 1 < ConvexDebugSegments.Num(); i += 2)
 			{
 				DrawDebugLine(World,
@@ -579,11 +862,13 @@ void UBox3DBodyComponent::DrawDebug() const
 		}
 		else // no convex collision resolved; the shape fell back to a box
 		{
-			DrawDebugBox(World, Location, ResolvedHalfExtent, Rotation, Color, false, -1.0f, 0, 1.0f);
+			DrawDebugBox(World, Location + Rotation.RotateVector(ResolvedBoxCenter),
+				ResolvedHalfExtent, Rotation, Color, false, -1.0f, 0, 1.0f);
 		}
 		break;
 	default: // Auto / Box
-		DrawDebugBox(World, Location, ResolvedHalfExtent, Rotation, Color, false, -1.0f, 0, 1.0f);
+		DrawDebugBox(World, Location + Rotation.RotateVector(ResolvedBoxCenter),
+			ResolvedHalfExtent, Rotation, Color, false, -1.0f, 0, 1.0f);
 		break;
 	}
 }

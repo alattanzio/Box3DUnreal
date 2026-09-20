@@ -37,8 +37,6 @@ FString UBox3DCollisionData::ComputeSourceFingerprint(const FString& MapPackageN
 	int64 TotalSize = Files.FileSize(*MapFilename);
 	int32 FileCount = 1;
 
-	// One File Per Actor: /Game/Maps/Foo.umap -> /Game/__ExternalActors__/Maps/Foo/**.uasset.
-	// Each actor is its own package, so an edited actor shows up here, not in the .umap.
 	const FString ExternalActorsPath = ULevel::GetExternalActorsPath(MapPackageName);
 	FString ExternalActorsDir;
 	if (!ExternalActorsPath.IsEmpty()

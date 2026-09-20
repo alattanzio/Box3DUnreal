@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Box3DEventTypes.h"
 #include "Components/ActorComponent.h"
 #include <box3d/box3d.h>
 #include "Box3DBodyComponent.generated.h"
@@ -64,10 +65,137 @@ public:
 	void CaptureStepTransform();
 	/** Subsystem hook: write Lerp(prev, curr, Alpha) to the owning actor. */
 	void ApplyInterpolatedTransform(float Alpha);
-	/** Subsystem hook: set the kinematic velocity to reach the actor pose in TimeStep. */
+	/** Manual kinematic push. The step loop uses GatherKinematicTargets instead. */
 	void PushKinematicTarget(float TimeStep);
 	/** Subsystem hook: draw this body's shape at the owning actor's current pose. */
 	void DrawDebug() const;
+
+
+	/** One-shot linear impulse through the centre of mass, in Unreal kg*cm/s. */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void AddImpulse(const FVector& Impulse, bool bWake = true);
+
+	/** Impulse at a world point (cm), so it also spins the body. */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void AddImpulseAtLocation(const FVector& Impulse, const FVector& WorldLocation, bool bWake = true);
+
+	/** Force through the centre of mass, kg*cm/s^2. Lasts one step - call it every frame. */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void AddForce(const FVector& Force, bool bWake = true);
+
+	/** Torque about the world axes, kg*cm^2/s^2 (same units as Chaos' AddTorqueInRadians). */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void AddTorque(const FVector& Torque, bool bWake = true);
+
+	/** Angular impulse about the world axes, kg*cm^2/s. */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void AddAngularImpulse(const FVector& AngularImpulse, bool bWake = true);
+
+	/** Set the linear velocity directly, in Unreal cm/s. */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void SetLinearVelocity(const FVector& Velocity, bool bWake = true);
+
+	/** Set the angular velocity directly, in rad/s about the Unreal world axes. */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void SetAngularVelocity(const FVector& AngularVelocity, bool bWake = true);
+
+	/** Multiplier on world gravity. 0 floats, negative falls upward. */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void SetGravityScale(float Scale);
+
+	/** Off keeps the body simulating forever. On (default) lets it rest and cost nothing. */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void SetSleepEnabled(bool bEnabled);
+
+	/** Move the body and clear its velocity. The actor snaps instead of sweeping. */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void TeleportBody(const FVector& Location, const FRotator& Rotation);
+
+
+	/** False on clients - check it before trusting the getters below. */
+	UFUNCTION(BlueprintPure, Category = "Box3D|Physics")
+	bool HasSimulationBody() const { return B3_IS_NON_NULL(BodyId); }
+
+	/** Linear velocity in cm/s. */
+	UFUNCTION(BlueprintPure, Category = "Box3D|Physics")
+	FVector GetLinearVelocity() const;
+
+	/** Angular velocity in rad/s about the world axes. */
+	UFUNCTION(BlueprintPure, Category = "Box3D|Physics")
+	FVector GetAngularVelocity() const;
+
+	/** Solved body mass in kg (density x shape volume). */
+	UFUNCTION(BlueprintPure, Category = "Box3D|Physics")
+	float GetBodyMass() const;
+
+	/** False once box3d has put the body to sleep. */
+	UFUNCTION(BlueprintPure, Category = "Box3D|Physics")
+	bool IsBodyAwake() const;
+
+	/** Wake a sleeping body so it resumes stepping (gravity, contacts). */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void WakeBody();
+
+	/**
+	 * Destroy this body's shapes and rebuild them from the current geometry, keeping the
+	 * body (and its transform and velocity) alive. Needed when the collision that fed the
+	 * shape changed after creation — most of all for a bConvexIncludesAttachedChildren
+	 * compound that just lost or gained a child. Mass is recomputed from the new shapes.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Box3D|Physics")
+	void RebuildShapes();
+
+
+	/** Fire hit events for hard collisions - impact sounds, damage, decals. Only one of the
+	 *  two bodies has to have it on. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box3D|Events",
+		meta = (DisplayName = "Simulation Generates Hit Events"))
+	bool bGenerateHitEvents = false;
+
+	/** Fire begin/end contact events for every touch, however gentle. Noisier than hit
+	 *  events - prefer those unless you need the touch itself. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box3D|Events",
+		meta = (DisplayName = "Generate Contact Events"))
+	bool bGenerateContactEvents = false;
+
+	/** Take part in overlaps. Needed on the trigger AND on whatever should be seen by it. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box3D|Events",
+		meta = (DisplayName = "Generate Overlap Events"))
+	bool bGenerateSensorEvents = false;
+
+	/** Turn this body into a trigger volume: it reports overlaps and never blocks anything.
+	 *  Use Static or Kinematic - a Dynamic trigger just falls out of the level. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box3D|Events",
+		meta = (DisplayName = "Is Trigger"))
+	bool bIsSensor = false;
+
+	/** Fire sleep/wake events. Handy for switching off VFX or audio on settled debris. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box3D|Events",
+		meta = (DisplayName = "Generate Sleep Events"))
+	bool bGenerateSleepEvents = false;
+
+	UPROPERTY(BlueprintAssignable, Category = "Box3D|Events")
+	FBox3DHitSignature OnBox3DHit;
+
+	UPROPERTY(BlueprintAssignable, Category = "Box3D|Events")
+	FBox3DTouchSignature OnBox3DBeginContact;
+
+	UPROPERTY(BlueprintAssignable, Category = "Box3D|Events")
+	FBox3DTouchSignature OnBox3DEndContact;
+
+	/** Fires on the trigger, with whatever entered in Other. */
+	UPROPERTY(BlueprintAssignable, Category = "Box3D|Events")
+	FBox3DTouchSignature OnBox3DBeginOverlap;
+
+	/** Fires on the trigger. Other can be null when it left by being destroyed. */
+	UPROPERTY(BlueprintAssignable, Category = "Box3D|Events")
+	FBox3DTouchSignature OnBox3DEndOverlap;
+
+	UPROPERTY(BlueprintAssignable, Category = "Box3D|Events")
+	FBox3DSleepSignature OnBox3DSleep;
+
+	UPROPERTY(BlueprintAssignable, Category = "Box3D|Events")
+	FBox3DSleepSignature OnBox3DWake;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box3D")
 	EBox3DBodyType BodyType = EBox3DBodyType::Dynamic;
@@ -84,6 +212,16 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Box3D|Shape", meta = (ClampMin = "0.0",
 		EditCondition = "Shape == EBox3DShape::Sphere || Shape == EBox3DShape::Capsule", EditConditionHides))
 	float Radius = 50.0f;
+
+	/**
+	 * Convex only: also build hulls from every primitive attached under the root, not just
+	 * the root itself — one compound body for a group of separate meshes. Use it when
+	 * several components should move as one rigid piece (a welded cluster of fracture
+	 * shards); leave off for an ordinary single-mesh actor.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Box3D|Shape",
+		meta = (EditCondition = "Shape == EBox3DShape::Convex", EditConditionHides))
+	bool bConvexIncludesAttachedChildren = false;
 
 	/** Half the distance between the capsule's hemisphere centers, in cm. */
 	UPROPERTY(EditAnywhere, Category = "Box3D|Shape", meta = (ClampMin = "0.0",
@@ -133,6 +271,9 @@ public:
 	int32 CollisionGroup = 0;
 
 protected:
+	/** Join the step task before touching this body's box3d state. */
+	void FenceAsyncStep() const;
+
 	void CreateBody();
 	void AddShape();
 	/** Attach convex hull shape(s) from the mesh's simple collision. Returns false if
@@ -145,7 +286,9 @@ protected:
 	void EnforceAuthorityContract();
 	void EnableReplication();
 	bool ComputeSimulationEligibility();
-	FVector ComputeAutoBoxHalfExtent() const;
+
+	/** Resolve ResolvedHalfExtent + ResolvedBoxCenter from the root's local bounds. */
+	void ResolveAutoBoxBounds();
 
 private:
 	UPROPERTY(Transient)
@@ -170,6 +313,11 @@ private:
 	/** Resolved box half-extents (cm) used for Auto/Box shapes; for debug draw. */
 	FVector ResolvedHalfExtent = FVector(50.0, 50.0, 50.0);
 
+	/** Local-space centre (cm) of the Auto / convex-fallback box. Non-zero whenever the
+	 *  root's geometry is offset from its own origin — the normal case for fracture
+	 *  pieces, whose verts stay in the source actor's space. Zero for an explicit Box. */
+	FVector ResolvedBoxCenter = FVector::ZeroVector;
+
 	/** Convex hull wireframe as line-list pairs in local Unreal space (cm, scale baked).
 	 *  Consecutive elements (2i, 2i+1) are one edge's endpoints. Empty unless Shape==Convex. */
 	TArray<FVector> ConvexDebugSegments;
@@ -177,4 +325,12 @@ private:
 	/** Interpolation endpoints in Unreal space (last two fixed steps). */
 	FTransform PrevTransform = FTransform::Identity;
 	FTransform CurrTransform = FTransform::Identity;
+
+	/** Last awake state, for the sleep/wake events. Bodies are created awake. */
+	bool bWasAwake = true;
+
+	/** Force/velocity requested before the body existed, flushed once it is created. */
+	FVector PendingLinearImpulse = FVector::ZeroVector;
+	FVector PendingAngularVelocity = FVector::ZeroVector;
+	bool bHasPendingAngularVelocity = false;
 };

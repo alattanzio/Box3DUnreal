@@ -5,20 +5,46 @@
 #include "CoreMinimal.h"
 #include <box3d/box3d.h>
 
-// The single place transforms cross the Unreal <-> box3d boundary.
-//
-// Unreal:  left-handed, Z-up, centimeters, LWC (FVector/FQuat are double).
-// box3d:   right-handed, no intrinsic up-axis, meters. Built with
-//          BOX3D_DOUBLE_PRECISION, so b3Pos translation is double, rotation float.
-//
-// Convention chosen here: keep Z as "up" in both spaces and convert handedness by
-// negating Y. That reflection (det = -1) maps left-handed <-> right-handed while
-// leaving gravity on Z. The quaternion transform for a Y-negation reflection is
-// (x, y, z, w) -> (-x, y, -z, w), which is its own inverse.
 namespace Box3D
 {
-	static constexpr double UnrealToMeters = 0.01;  // cm -> m
-	static constexpr double MetersToUnreal = 100.0; // m  -> cm
+	/** cm -> box3d length units. 0.01 in Meters mode, 1.0 in Centimeters mode. */
+	extern BOX3DUNREAL_API double UnrealToMeters;
+
+	/** box3d length units -> cm. The reciprocal of the above. */
+	extern BOX3DUNREAL_API double MetersToUnreal;
+
+	/** Resolve box3d.LengthUnits and push it into box3d. Called before world creation;
+	 *  a later cvar change only takes effect on the next world. Returns 1 or 100. */
+	BOX3DUNREAL_API float InitializeLengthUnits();
+
+	BOX3DUNREAL_API bool IsCentimeterMode();
+
+	/** kg/m^3 -> box3d's kg per cubic length unit. Miss this in centimeter mode and
+	 *  bodies come out 1e6 too heavy. */
+	FORCEINLINE float ToBox3DDensity(float DensityKgPerCubicMeter)
+	{
+		const double LengthUnits = IsCentimeterMode() ? 100.0 : 1.0;
+		return static_cast<float>(DensityKgPerCubicMeter / (LengthUnits * LengthUnits * LengthUnits));
+	}
+
+	/** Pin the length unit for a scope. For tests, which build worlds in fixed units while
+	 *  a live world may be using the other mode. */
+	struct BOX3DUNREAL_API FScopedLengthUnits
+	{
+		explicit FScopedLengthUnits(float UnitsPerMeter)
+			: Previous(b3GetLengthUnitsPerMeter())
+		{
+			b3SetLengthUnitsPerMeter(UnitsPerMeter);
+		}
+
+		~FScopedLengthUnits() { b3SetLengthUnitsPerMeter(Previous); }
+
+		FScopedLengthUnits(const FScopedLengthUnits&) = delete;
+		FScopedLengthUnits& operator=(const FScopedLengthUnits&) = delete;
+
+	private:
+		float Previous;
+	};
 
 	/** World position (double translation). Use for body positions. */
 	FORCEINLINE b3Pos ToBox3DPosition(const FVector& V)
@@ -57,6 +83,19 @@ namespace Box3D
 		return FVector(V.x, -V.y, V.z);
 	}
 
+	/** Angular velocity / torque / angular impulse. These are pseudovectors, so the Y-negation
+	 *  reflection maps them like the quaternion's vector part: negate X and Z, not Y. No
+	 *  cm<->m scale here - apply any unit factor at the call site. */
+	FORCEINLINE b3Vec3 ToBox3DAngular(const FVector& V)
+	{
+		return b3Vec3{ static_cast<float>(-V.X), static_cast<float>(V.Y), static_cast<float>(-V.Z) };
+	}
+
+	FORCEINLINE FVector FromBox3DAngular(const b3Vec3& V)
+	{
+		return FVector(-V.x, V.y, -V.z);
+	}
+
 	FORCEINLINE b3Quat ToBox3DQuat(const FQuat& Q)
 	{
 		return b3Quat{
@@ -73,5 +112,16 @@ namespace Box3D
 	FORCEINLINE FTransform FromBox3DTransform(const b3WorldTransform& T)
 	{
 		return FTransform(FromBox3DQuat(T.q), FromBox3DPosition(T.p));
+	}
+
+	/** Joint frames: b3Transform has a float translation, b3WorldTransform a double. */
+	FORCEINLINE b3Transform ToBox3DLocalFrame(const FTransform& T)
+	{
+		return b3Transform{ ToBox3DVector(T.GetLocation()), ToBox3DQuat(T.GetRotation()) };
+	}
+
+	FORCEINLINE FTransform FromBox3DLocalFrame(const b3Transform& T)
+	{
+		return FTransform(FromBox3DQuat(T.q), FromBox3DVector(T.p));
 	}
 }

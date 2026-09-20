@@ -5,10 +5,6 @@
 #include "CoreMinimal.h"
 #include "Box3DCollisionData.generated.h"
 
-// Baked static collision: UE cooked collision already converted into box3d local
-// space (meters, scale baked, Y negated, winding fixed). Saved once in the editor
-// so packaged builds never runtime-cook tri-meshes (GetPhysicsTriMeshData is
-// editor/PIE-reliable only). See the integration doc §5, §8, milestone 5.
 
 // One shape's kind. Mirrors what the extraction produces; the loader switches on it.
 UENUM()
@@ -20,8 +16,6 @@ enum class EBox3DBakedShapeKind : uint8
 	Capsule   // CenterA/CenterB (hemisphere centers) + Radius.
 };
 
-// One box3d shape in a body's local space. All coordinates are box3d meters with the
-// owning actor's scale already baked in (box3d shapes carry no scale).
 USTRUCT()
 struct FBox3DBakedShape
 {
@@ -51,15 +45,11 @@ struct FBox3DBakedShape
 	float Radius = 0.0f;
 };
 
-// One static body: the actor's world transform (scale baked into the shapes) plus its
-// shapes. Self-contained, so the runtime instantiates it without the source actor.
 USTRUCT()
 struct FBox3DBakedBody
 {
 	GENERATED_BODY()
 
-	// Actor world transform at bake time (Unreal space). Only location + rotation are
-	// used to place the body; scale is baked into the shape geometry.
 	UPROPERTY()
 	FTransform WorldTransform = FTransform::Identity;
 

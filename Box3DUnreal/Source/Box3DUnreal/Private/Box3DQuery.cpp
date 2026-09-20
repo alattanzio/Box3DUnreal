@@ -6,8 +6,6 @@
 #include "Box3DSubsystem.h"
 #include "GameFramework/Actor.h"
 
-// Spatial queries against the box3d world (doc §11). box3d owns the collision data for
-// driven actors, so these answer against the authoritative sim rather than Chaos.
 
 namespace
 {
@@ -136,8 +134,8 @@ uint32 UBox3DSubsystem::ComputeWorldStateHash(int32& OutBodyCount) const
 		return 0;
 	}
 
-	// Gather live dynamic bodies, then sort by owner path name for a stable fold order - the
-	// registration order (BeginPlay) is not reproducible, but the path name is.
+	FlushAsyncStep();
+
 	TArray<TPair<FString, b3BodyId>> Bodies;
 	Bodies.Reserve(DynamicBodies.Num());
 	for (const TWeakObjectPtr<UBox3DBodyComponent>& Weak : DynamicBodies)
@@ -170,6 +168,8 @@ bool UBox3DSubsystem::RaycastClosest(const FVector& Start, const FVector& End, c
 		return false;
 	}
 
+	FlushAsyncStep();
+
 	const b3RayResult Result = b3World_CastRayClosest(
 		WorldId, Box3D::ToBox3DPosition(Start), Box3D::ToBox3DVector(Delta), MakeQueryFilter(Filter));
 	if (!Result.hit)
@@ -192,6 +192,8 @@ bool UBox3DSubsystem::RaycastMulti(const FVector& Start, const FVector& End, con
 		return false;
 	}
 
+	FlushAsyncStep();
+
 	FCastContext Ctx;
 	Ctx.Length = Delta.Size();
 	Ctx.Hits = &OutHits;
@@ -212,8 +214,8 @@ bool UBox3DSubsystem::OverlapAABB(const FVector& Center, const FVector& HalfExte
 		return false;
 	}
 
-	// Negating Y swaps the box's min and max on that axis, so rebuild the bounds from
-	// both converted corners instead of converting min/max directly.
+	FlushAsyncStep();
+
 	const FVector H = HalfExtent.GetAbs();
 	const b3Vec3 A = Box3D::ToBox3DVector(Center - H);
 	const b3Vec3 B = Box3D::ToBox3DVector(Center + H);
@@ -235,6 +237,8 @@ bool UBox3DSubsystem::OverlapSphere(const FVector& Center, float Radius, const F
 		return false;
 	}
 
+	FlushAsyncStep();
+
 	b3Vec3 Point;
 	const b3ShapeProxy Proxy = MakeSphereProxy(Point, Radius);
 	b3World_OverlapShape(WorldId, Box3D::ToBox3DPosition(Center), &Proxy, MakeQueryFilter(Filter), &OverlapCallback,
@@ -250,6 +254,8 @@ bool UBox3DSubsystem::OverlapBox(const FVector& Center, const FVector& HalfExten
 	{
 		return false;
 	}
+
+	FlushAsyncStep();
 
 	b3Vec3 Points[8];
 	const b3ShapeProxy Proxy = MakeBoxProxy(Points, HalfExtent, Rotation);
@@ -267,6 +273,8 @@ bool UBox3DSubsystem::SphereCast(const FVector& Start, const FVector& End, float
 	{
 		return false;
 	}
+
+	FlushAsyncStep();
 
 	b3Vec3 Point;
 	const b3ShapeProxy Proxy = MakeSphereProxy(Point, Radius);
@@ -289,6 +297,8 @@ bool UBox3DSubsystem::BoxCast(const FVector& Start, const FVector& End, const FV
 	{
 		return false;
 	}
+
+	FlushAsyncStep();
 
 	b3Vec3 Points[8];
 	const b3ShapeProxy Proxy = MakeBoxProxy(Points, HalfExtent, Rotation);
