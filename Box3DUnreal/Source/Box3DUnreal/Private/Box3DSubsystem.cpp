@@ -2,9 +2,11 @@
 
 #include "Box3DSubsystem.h"
 #include "Box3DBodyComponent.h"
+#include "Box3DCharacterComponent.h"
 #include "Box3DCollisionData.h"
 #include "Box3DConversion.h"
 #include "Box3DStaticGeometry.h"
+#include "Box3DStats.h"
 #include "Box3DLog.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
@@ -18,6 +20,27 @@ static TAutoConsoleVariable<int32> CVarBox3DDebugDraw(
 	TEXT("box3d.DebugDraw"),
 	0,
 	TEXT("Draw box3d dynamic bodies at their actual simulation transform (1 = on)."),
+	ECVF_Cheat);
+
+static TAutoConsoleVariable<int32> CVarBox3DNativeDraw(
+	TEXT("box3d.NativeDraw"),
+	0,
+	TEXT("box3d's own debug renderer, as a bitmask. 0 = off. Shows what the solver sees.\n")
+	TEXT("  1 shapes  2 joints  4 jointExtras  8 bounds  16 mass  32 sleep\n")
+	TEXT("  64 contacts  128 contactNormals  256 contactForces  512 islands  1024 graphColors\n")
+	TEXT("Try 67 (shapes+joints+contacts). Authority only."),
+	ECVF_Cheat);
+
+static TAutoConsoleVariable<float> CVarBox3DNativeDrawRange(
+	TEXT("box3d.NativeDrawRange"),
+	5000.0f,
+	TEXT("Half-extent (cm) of the box around the camera that box3d.NativeDraw covers."),
+	ECVF_Cheat);
+
+static TAutoConsoleVariable<float> CVarBox3DNativeDrawThickness(
+	TEXT("box3d.NativeDrawThickness"),
+	1.0f,
+	TEXT("Line thickness for box3d.NativeDraw."),
 	ECVF_Cheat);
 
 static TAutoConsoleVariable<int32> CVarBox3DEnabled(
@@ -42,13 +65,8 @@ void UBox3DSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 {
 	Super::OnWorldBeginPlay(InWorld);
 
-	// box3d is server-authoritative: only Standalone and servers simulate. A pure
-	// client leaves its actors to UE's replicated movement, so it never spins up a
-	// second (diverging) world.
 	bIsAuthority = InWorld.GetNetMode() != NM_Client;
 
-	// Watch box3d.Enabled so it can be toggled live in PIE. The sink fires for any cvar
-	// change; OnEnabledCVarChanged filters to an actual on<->off transition.
 	EnabledSinkHandle = IConsoleManager::Get().RegisterConsoleVariableSink_Handle(
 		FConsoleCommandDelegate::CreateUObject(this, &UBox3DSubsystem::OnEnabledCVarChanged));
 
@@ -58,6 +76,9 @@ void UBox3DSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 			TEXT("box3d: client world - simulation disabled; actors follow replicated movement."));
 		return;
 	}
+
+	// Registered even when AsyncStep is off - both hooks early-out, keeping the cvar live.
+	RegisterStepTickFunctions();
 
 	if (IsBox3DEnabled())
 	{
@@ -82,9 +103,6 @@ void UBox3DSubsystem::EnableSimulation()
 	// Pre-baked static collision: instantiate cached bodies with no runtime cooking.
 	LoadBakedStaticGeometry();
 
-	// Opt-in bulk static path: watch level streaming and scan the already-loaded
-	// levels. Static bodies never move, so only the authority (which simulates)
-	// needs them - clients follow replicated dynamics and create no world.
 	if (!StaticGeometryTag.IsNone())
 	{
 		LevelAddedHandle = FWorldDelegates::LevelAddedToWorld.AddUObject(this, &UBox3DSubsystem::OnLevelAddedToWorld);
@@ -98,9 +116,6 @@ void UBox3DSubsystem::EnableSimulation()
 		}
 	}
 
-	// Runtime re-enable: components already registered (in their BeginPlay) but with no
-	// body. Build them now. On the initial startup this list is empty - each component
-	// builds itself in BeginPlay - so this is a no-op then.
 	for (int32 Index = AllBodies.Num() - 1; Index >= 0; --Index)
 	{
 		if (UBox3DBodyComponent* Body = AllBodies[Index].Get())
@@ -116,9 +131,6 @@ void UBox3DSubsystem::EnableSimulation()
 
 void UBox3DSubsystem::DisableSimulation()
 {
-	// Destroy component-owned bodies while the world is still valid (b3DestroyWorld would
-	// otherwise leave their handles dangling). They stay registered in AllBodies so a
-	// later enable rebuilds them.
 	for (int32 Index = AllBodies.Num() - 1; Index >= 0; --Index)
 	{
 		if (UBox3DBodyComponent* Body = AllBodies[Index].Get())
@@ -177,6 +189,9 @@ void UBox3DSubsystem::OnEnabledCVarChanged()
 
 void UBox3DSubsystem::Deinitialize()
 {
+	FlushAsyncStep();
+	UnregisterStepTickFunctions();
+
 	// Always registered in OnWorldBeginPlay (authority and client); drop it here.
 	IConsoleManager::Get().UnregisterConsoleVariableSink_Handle(EnabledSinkHandle);
 	if (LevelAddedHandle.IsValid())
@@ -208,15 +223,13 @@ void UBox3DSubsystem::CreateBox3DWorld()
 		return;
 	}
 
+	// Before b3DefaultWorldDef: its defaults are derived from the length unit.
+	Box3D::InitializeLengthUnits();
+
 	b3WorldDef Def = b3DefaultWorldDef();
 	Def.gravity = Box3D::ToBox3DVector(Gravity);
+	Def.hitEventThreshold = HitEventThreshold * static_cast<float>(Box3D::UnrealToMeters);
 
-	// Pin the worker count. box3d's built-in scheduler re-partitions the constraint graph by
-	// worker count, so >1 is not reproducible across peers (the headers call replaying at a
-	// different count a "cross-thread determinism test"). 1 = serial, the deterministic path a
-	// server-authoritative sim and any future rollback rely on (doc §10, §14). It is also the
-	// box3d default today (workerCount 0 -> serial fallback) - setting it explicitly stops a
-	// later "enable workers for perf" from silently breaking determinism.
 	Def.workerCount = static_cast<uint32>(FMath::Max(1, WorkerCount));
 
 	WorldId = b3CreateWorld(&Def);
@@ -238,15 +251,14 @@ void UBox3DSubsystem::CreateBox3DWorld()
 
 void UBox3DSubsystem::DestroyBox3DWorld()
 {
-	// Component registrations are preserved (the enable/disable toggle rebuilds from
-	// them); Deinitialize drops them on full shutdown. Only tear down box3d resources here.
+	FlushAsyncStep();
+	AsyncStepCount = 0;
+
 	if (bWorldValid)
 	{
 		b3DestroyWorld(WorldId); // destroys every body, including bulk static ones
 	}
 
-	// Bulk tri-mesh data are separate allocations the (now destroyed) shapes referenced;
-	// free them after the world so nothing dangles.
 	for (TPair<TWeakObjectPtr<ULevel>, FBulkStaticLevel>& Pair : BulkStaticLevels)
 	{
 		for (b3MeshData* Mesh : Pair.Value.Meshes)
@@ -272,9 +284,21 @@ void UBox3DSubsystem::DestroyBox3DWorld()
 	}
 	BakedStaticBuckets.Reset();
 
+	DestroyAllJoints(); // the world took the joints with it; drop the slot table
+
 	WorldId = b3_nullWorldId;
 	bWorldValid = false;
 	Accumulator = 0.0;
+
+	// Any pending event points at a body that is gone now. Drop them.
+	PendingBeginContact.Reset();
+	PendingEndContact.Reset();
+	PendingBeginOverlap.Reset();
+	PendingEndOverlap.Reset();
+	PendingHits.Reset();
+	PendingWorldHits.Reset();
+	PendingSleep.Reset();
+	PendingWake.Reset();
 }
 
 void UBox3DSubsystem::OnLevelAddedToWorld(ULevel* Level, UWorld* World)
@@ -314,9 +338,6 @@ void UBox3DSubsystem::RegisterLevelStaticGeometry(ULevel* Level)
 		return;
 	}
 
-	// Deterministic creation order: streaming completion order is not stable, but body
-	// creation order affects island assignment / reproducibility (doc §8). Sort by the
-	// stable full path name.
 	Tagged.Sort([](const AActor& A, const AActor& B) { return A.GetPathName() < B.GetPathName(); });
 
 	FBulkStaticLevel Bulk;
@@ -394,8 +415,6 @@ void UBox3DSubsystem::CreateBulkStaticBody(AActor* Actor, FBulkStaticLevel& Bulk
 	ShapeDef.baseMaterial.friction = StaticGeometryFriction;
 	ShapeDef.baseMaterial.restitution = StaticGeometryRestitution;
 
-	// Reuse the component path's cooked-collision extraction (scale/handedness/winding
-	// all handled there). Auto = complex tri-mesh if present, else simple primitives.
 	if (Box3D::StaticGeometry::AddStaticShapes(
 			Body, ShapeDef, Actor, Box3D::StaticGeometry::ESource::Auto, /*bInvertWinding=*/false, Bulk.Meshes))
 	{
@@ -465,8 +484,6 @@ void UBox3DSubsystem::WarnIfBakeStale(const UBox3DCollisionData* Data) const
 	FString Reason;
 	if (Data != nullptr && Data->IsStale(Reason))
 	{
-		// Warn, never refuse: stale geometry is usually still close enough to keep iterating on,
-		// and an implicit re-bake here would stall PIE for however long the level takes.
 		UE_LOG(LogBox3D, Warning,
 			TEXT("box3d: baked collision '%s' is stale - %s. Static geometry may not match the level; ")
 			TEXT("re-bake with: -run=Box3DBake -Map=%s"),
@@ -540,6 +557,49 @@ void UBox3DSubsystem::LoadBakedStaticGeometry()
 	}
 }
 
+FVector UBox3DSubsystem::GetGravity() const
+{
+	if (!bWorldValid)
+	{
+		return Gravity;
+	}
+	FlushAsyncStep();
+	return Box3D::FromBox3DVector(b3World_GetGravity(WorldId));
+}
+
+void UBox3DSubsystem::SetGravity(const FVector& NewGravity)
+{
+	Gravity = NewGravity; // kept so a rebuild after a box3d.Enabled toggle picks it up
+	if (bWorldValid)
+	{
+		FlushAsyncStep();
+		b3World_SetGravity(WorldId, Box3D::ToBox3DVector(NewGravity));
+	}
+}
+
+void UBox3DSubsystem::ApplyRadialImpulse(const FVector& Center, float Radius, float Falloff,
+	float ImpulsePerArea, const FBox3DQueryFilter& Filter)
+{
+	if (!bWorldValid)
+	{
+		return; // client, or box3d disabled
+	}
+
+	FlushAsyncStep();
+
+	b3ExplosionDef Def = b3DefaultExplosionDef();
+	Def.position = Box3D::ToBox3DPosition(Center);
+	Def.radius = Radius * static_cast<float>(Box3D::UnrealToMeters);
+	Def.falloff = Falloff * static_cast<float>(Box3D::UnrealToMeters);
+	Def.impulsePerArea = ImpulsePerArea;
+	if (Filter.Mask != 0)
+	{
+		Def.maskBits = static_cast<uint64>(static_cast<uint32>(Filter.Mask));
+	}
+
+	b3World_Explode(WorldId, &Def);
+}
+
 void UBox3DSubsystem::RegisterBody(UBox3DBodyComponent* Component)
 {
 	if (Component != nullptr)
@@ -571,10 +631,21 @@ void UBox3DSubsystem::UnregisterBody(UBox3DBodyComponent* Component)
 	AllBodies.RemoveSingleSwap(Component);
 }
 
+void UBox3DSubsystem::RegisterCharacter(UBox3DCharacterComponent* Character)
+{
+	if (Character != nullptr)
+	{
+		Characters.AddUnique(Character);
+	}
+}
+
+void UBox3DSubsystem::UnregisterCharacter(UBox3DCharacterComponent* Character)
+{
+	Characters.RemoveSingleSwap(Character);
+}
+
 bool UBox3DSubsystem::IsTickable() const
 {
-	// Authority worlds tick to step; client worlds tick only to debug-draw the
-	// replicated bodies they registered.
 	return bWorldValid || AllBodies.Num() > 0;
 }
 
@@ -587,26 +658,29 @@ void UBox3DSubsystem::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
-	// Only authority worlds step; but debug draw runs everywhere so clients can see
-	// their replicated bodies.
-	if (bWorldValid)
+	if (bWorldValid && !IsAsyncStepEnabled())
 	{
 		StepFixed(DeltaTime);
+
+		DispatchPendingEvents();
 	}
 
-	// Debug draw only while box3d is enabled - a disabled sim leaves no bodies to show,
-	// so the wireframes/counter must vanish too (else it looks like it's still running).
 	if (IsBox3DEnabled() && CVarBox3DDebugDraw.GetValueOnGameThread() != 0)
 	{
 		DebugDraw();
+	}
+
+	NativeDrawFlags = IsBox3DEnabled() ? CVarBox3DNativeDraw.GetValueOnGameThread() : 0;
+	if (NativeDrawFlags != 0)
+	{
+		NativeDrawRange = CVarBox3DNativeDrawRange.GetValueOnGameThread();
+		NativeDrawThickness = CVarBox3DNativeDrawThickness.GetValueOnGameThread();
+		NativeDebugDraw();
 	}
 }
 
 void UBox3DSubsystem::DebugDraw()
 {
-	// One-shot confirmation the *new* debug path is running (settles stale-build
-	// questions: if you don't see this line after enabling the cvar, the binary
-	// wasn't rebuilt).
 	static bool bLoggedOnce = false;
 	if (!bLoggedOnce)
 	{
@@ -648,10 +722,6 @@ void UBox3DSubsystem::DebugDraw()
 		}
 	}
 
-	// Bulk static bodies have no component to draw themselves, so draw each one's world
-	// AABB here (cyan, the static colour). It's an approximation - the box3d shape is the
-	// actor's cooked collision, not a box - but it confirms a body exists at the right
-	// place and span. Only the authority holds these (clients keep BulkStaticLevels empty).
 	if (UWorld* World = GetWorld())
 	{
 		auto DrawBodyAABBs = [World](const TArray<b3BodyId>& Bodies)
@@ -663,8 +733,6 @@ void UBox3DSubsystem::DebugDraw()
 					continue;
 				}
 
-				// Convert both corners: the Y-negation swaps min/max on Y, so rebuild the
-				// box from the two converted points rather than assuming lower<upper.
 				const b3AABB Box = b3Body_ComputeAABB(Body);
 				FBox UEBox(ForceInit);
 				UEBox += Box3D::FromBox3DVector(Box.lowerBound);
@@ -686,43 +754,62 @@ void UBox3DSubsystem::DebugDraw()
 
 void UBox3DSubsystem::StepFixed(float DeltaTime)
 {
-	// Consume real time in whole fixed steps. After each step, capture every
-	// dynamic body's transform so we always have the last two states to blend.
 	Accumulator = FMath::Min(Accumulator + DeltaTime, static_cast<double>(MaxFrameTime));
+
+	// Profile is per-step and a frame may take several, so sum rather than overwrite.
+	FBox3DFrameProfile Frame;
 
 	while (Accumulator >= FixedTimeStep)
 	{
-		// Drive kinematic bodies from their (gameplay-moved) actor transform so they
-		// carry resting dynamics.
-		for (int32 Index = KinematicBodies.Num() - 1; Index >= 0; --Index)
+		TArray<FKinematicTarget> KinematicTargets;
+		GatherKinematicTargets(KinematicTargets);
+		ApplyKinematicTargets(KinematicTargets, FixedTimeStep);
+
+		StepWorldOnly(Frame);
+		FinishStepGameThread();
+	}
+
+	PublishStats(Frame);
+	ApplyRenderInterpolation();
+}
+
+void UBox3DSubsystem::FinishStepGameThread()
+{
+	Accumulator -= FixedTimeStep;
+	++SimulationFrame; // the timeline a rollback tags against
+
+	DrainStepEvents(); // per step: box3d overwrites its buffers on the next one
+	UpdateBreakableJoints();
+
+	// After the solve, so characters collide against settled geometry.
+	for (int32 Index = Characters.Num() - 1; Index >= 0; --Index)
+	{
+		if (UBox3DCharacterComponent* Character = Characters[Index].Get())
 		{
-			if (UBox3DBodyComponent* Body = KinematicBodies[Index].Get())
-			{
-				Body->PushKinematicTarget(FixedTimeStep);
-			}
-			else
-			{
-				KinematicBodies.RemoveAtSwap(Index);
-			}
+			Character->SolveMove(FixedTimeStep);
 		}
-
-		b3World_Step(WorldId, FixedTimeStep, SubStepCount);
-		Accumulator -= FixedTimeStep;
-		++SimulationFrame; // monotonic fixed-step index: the timeline a rollback tags against (§11b)
-
-		for (int32 Index = DynamicBodies.Num() - 1; Index >= 0; --Index)
+		else
 		{
-			if (UBox3DBodyComponent* Body = DynamicBodies[Index].Get())
-			{
-				Body->CaptureStepTransform();
-			}
-			else
-			{
-				DynamicBodies.RemoveAtSwap(Index);
-			}
+			Characters.RemoveAtSwap(Index);
 		}
 	}
 
+	SCOPE_CYCLE_COUNTER(STAT_Box3DBodySync);
+	for (int32 Index = DynamicBodies.Num() - 1; Index >= 0; --Index)
+	{
+		if (UBox3DBodyComponent* Body = DynamicBodies[Index].Get())
+		{
+			Body->CaptureStepTransform();
+		}
+		else
+		{
+			DynamicBodies.RemoveAtSwap(Index);
+		}
+	}
+}
+
+void UBox3DSubsystem::ApplyRenderInterpolation()
+{
 	// Interpolate the render pose between the last two steps (leftover fraction).
 	const float Alpha = static_cast<float>(Accumulator / FixedTimeStep);
 	for (const TWeakObjectPtr<UBox3DBodyComponent>& WeakBody : DynamicBodies)
@@ -730,6 +817,14 @@ void UBox3DSubsystem::StepFixed(float DeltaTime)
 		if (UBox3DBodyComponent* Body = WeakBody.Get())
 		{
 			Body->ApplyInterpolatedTransform(Alpha);
+		}
+	}
+
+	for (const TWeakObjectPtr<UBox3DCharacterComponent>& WeakCharacter : Characters)
+	{
+		if (UBox3DCharacterComponent* Character = WeakCharacter.Get())
+		{
+			Character->ApplyToActor();
 		}
 	}
 }
