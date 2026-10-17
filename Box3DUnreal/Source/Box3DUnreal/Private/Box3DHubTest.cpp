@@ -3,6 +3,7 @@
 #include "Box3DConversion.h"
 #include "Box3DJoints.h"
 #include "Box3DLog.h"
+#include "HAL/IConsoleManager.h"
 #include <box3d/box3d.h>
 
 /**
