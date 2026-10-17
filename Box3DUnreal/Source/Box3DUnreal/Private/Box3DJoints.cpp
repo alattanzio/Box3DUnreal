@@ -5,6 +5,7 @@
 #include "Box3DConversion.h"
 #include "Box3DLog.h"
 #include "Box3DSubsystem.h"
+#include "Engine/Engine.h"
 #include "Engine/World.h"
 
 namespace
