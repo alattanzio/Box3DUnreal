@@ -147,8 +147,13 @@ void UBox3DCharacterComponent::SolveMove(float TimeStep)
 	const float ToM = static_cast<float>(Box3D::UnrealToMeters);
 
 	{
-		b3Vec3 Horizontal{ Velocity.x, Velocity.y, 0.0f };
-		const float Speed = b3Length(Horizontal);
+		// On the ground, friction acts on the whole velocity, as in box3d's Mover sample
+		// (samples/sample.cpp, CharacterMover::SolveMove). Gravity keeps integrating into
+		// Velocity.z while the pogo spring holds the capsule up; damping it gives a terminal value
+		// the spring balances. Horizontal-only friction let it grow until the capsule reached the
+		// floor and was clipped and relaunched: a steady bounce while standing still.
+		const b3Vec3 Horizontal{ Velocity.x, Velocity.y, 0.0f };
+		const float Speed = bOnGround ? b3Length(Velocity) : b3Length(Horizontal);
 		if (Speed < MinSpeed)
 		{
 			Velocity.x = 0.0f;
@@ -159,9 +164,7 @@ void UBox3DCharacterComponent::SolveMove(float TimeStep)
 			const float Control = FMath::Max(Speed, StopSpeed * ToM);
 			const float Drop = Control * Friction * TimeStep;
 			const float NewSpeed = FMath::Max(0.0f, Speed - Drop);
-			const float Scale = NewSpeed / Speed;
-			Velocity.x *= Scale;
-			Velocity.y *= Scale;
+			Velocity = b3MulSV(NewSpeed / Speed, Velocity);
 		}
 	}
 
